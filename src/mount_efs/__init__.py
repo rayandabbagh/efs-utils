@@ -34,6 +34,7 @@ import base64
 import errno
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -119,6 +120,7 @@ FALLBACK_TO_MOUNT_TARGET_IP_ADDRESS_ITEM = (
 )
 INSTANCE_IDENTITY = None
 INSTANCE_AZ_ID_METADATA = None
+IPV6_ENABLED = "ipv6"
 RETRYABLE_ERRORS = ["reset by peer"]
 OPTIMIZE_READAHEAD_ITEM = "optimize_readahead"
 
@@ -237,6 +239,7 @@ EFS_ONLY_OPTIONS = [
     "az",
     "cafile",
     "iam",
+    "ipv6",
     "mounttargetip",
     "netns",
     "noocsp",
@@ -315,6 +318,22 @@ WEB_IDENTITY_TOKEN_FILE_ENV = "AWS_WEB_IDENTITY_TOKEN_FILE"
 ECS_FARGATE_TASK_METADATA_ENDPOINT_ENV = "ECS_CONTAINER_METADATA_URI_V4"
 ECS_FARGATE_TASK_METADATA_ENDPOINT_URL_EXTENSION = "/task"
 ECS_FARGATE_CLIENT_IDENTIFIER = "ecs.fargate"
+
+
+def is_ipv6_address(ip_address):
+    try:
+        return isinstance(ipaddress.ip_address(ip_address), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def getIpAddressString(ip_address):
+    try:
+        ip = ipaddress.ip_address(ip_address)
+        return str(ip)  # This will return the IP address as a string without brackets
+    except ValueError:
+        # If it's not a valid IP address, treat it as a hostname
+        return ip_address
 
 
 def errcheck(ret, func, args):
@@ -906,7 +925,8 @@ def get_mount_config(config, region, config_name):
         return config.get(CONFIG_SECTION, config_name)
     except NoOptionError:
         fatal_error(
-            "Error retrieving config. Please set the {} configuration in efs-utils.conf".format(config_name)
+            f"Error retrieving config. Please set the {config_name} configuration "
+            "in efs-utils.conf"
         )
 
 
@@ -1392,6 +1412,7 @@ def write_stunnel_config_file(
     cert_details=None,
     fallback_ip_address=None,
     efs_proxy_enabled=True,
+    ipv6=False,
 ):
     """
     Serializes stunnel configuration to a file. Unfortunately this does not conform to Python's config file format, so we have to
@@ -1468,7 +1489,6 @@ def write_stunnel_config_file(
     )
 
     if tls_enabled(options):
-        # These config options are not applicable to non-tls mounts with efs-proxy
         if get_boolean_config_item_value(
             config, CONFIG_SECTION, "stunnel_check_cert_hostname", default_value=True
         ):
@@ -1477,7 +1497,14 @@ def write_stunnel_config_file(
             ):
                 fatal_error(tls_controls_message % "stunnel_check_cert_hostname")
             else:
-                efs_config["checkHost"] = dns_name[dns_name.index(fs_id) :]
+                try:
+                    ip = ipaddress.ip_address(dns_name)
+                    efs_config["checkHost"] = str(
+                        ip
+                    )  # Use full IP address (IPv4 or IPv6)
+                except ValueError:
+                    # If it's not a valid IP address, treat it as a hostname
+                    efs_config["checkHost"] = dns_name[dns_name.index(fs_id) :]
 
         # Only use the config setting if the override is not set
         if not efs_proxy_enabled and ocsp_enabled:
@@ -1748,6 +1775,7 @@ def bootstrap_proxy(
     state_file_dir=STATE_FILE_DIR,
     fallback_ip_address=None,
     efs_proxy_enabled=True,
+    ipv6=False,
 ):
     """
     Generates a TLS private key and client-side certificate, a stunnel configuration file, and a state file
@@ -1864,6 +1892,7 @@ def bootstrap_proxy(
             cert_details=cert_details,
             fallback_ip_address=fallback_ip_address,
             efs_proxy_enabled=efs_proxy_enabled,
+            ipv6=ipv6,
         )
         if efs_proxy_enabled:
             if "tls" in options:
@@ -2021,32 +2050,58 @@ def get_nfs_mount_options(options, config):
     return ",".join(nfs_options)
 
 
+def get_ipv6_addresses(hostname):
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None, socket.AF_INET6)
+        return [addr[4][0] for addr in addrinfo]
+    except socket.gaierror:
+        return []
+
+
 def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=None):
+    def format_mount_path(address, path):
+        if is_ipv6_address(address):
+            return "[%s]:%s" % (address, path)
+        return "%s:%s" % (address, path)
+
     if legacy_stunnel_mode_enabled(options, config):
         if "tls" in options:
             mount_path = "127.0.0.1:%s" % path
         elif fallback_ip_address:
-            mount_path = "%s:%s" % (fallback_ip_address, path)
+            mount_path = format_mount_path(fallback_ip_address, path)
         else:
-            mount_path = "%s:%s" % (dns_name, path)
+            mount_path = format_mount_path(dns_name, path)
     else:
         mount_path = "127.0.0.1:%s" % path
 
-    if not check_if_platform_is_mac():
+    if IPV6_ENABLED in options:
+        ipv6_addresses = get_ipv6_addresses(dns_name)
+        if not ipv6_addresses:
+            logging.warning("IPv6 specified but no IPv6 address found for %s", dns_name)
+            if options.get(IPV6_ENABLED):
+                logging.info("Falling back to IPv4")
+                options.pop(IPV6_ENABLED, None)
+                options.pop("ipv6", None)
+            else:
+                fatal_error("IPv6 address required but not available for %s" % dns_name)
+
+    nfs_options = get_nfs_mount_options(options, config)
+
+    if check_if_platform_is_mac():
+        command = [
+            "/sbin/mount_nfs",
+            "-o",
+            nfs_options,
+            mount_path,
+            mountpoint,
+        ]
+    else:
         command = [
             "/sbin/mount.nfs4",
             mount_path,
             mountpoint,
             "-o",
-            get_nfs_mount_options(options, config),
-        ]
-    else:
-        command = [
-            "/sbin/mount_nfs",
-            "-o",
-            get_nfs_mount_options(options, config),
-            mount_path,
-            mountpoint,
+            nfs_options,
         ]
 
     if "netns" in options:
@@ -2254,6 +2309,9 @@ def parse_arguments(config, args=None):
     fsname = None
     mountpoint = None
     options = {}
+
+    if "ipv6" in options:
+        options[IPV6_ENABLED] = True
 
     if not check_if_platform_is_mac():
         if len(args) > 1:
@@ -2683,6 +2741,9 @@ def bootstrap_logging(config, log_dir=LOG_DIR):
 
 
 def get_dns_name_and_fallback_mount_target_ip_address(config, fs_id, options):
+    if "ipv6" in options:
+        options[IPV6_ENABLED] = True
+
     def _validate_replacement_field_count(format_str, expected_ct):
         if format_str.count("{") != expected_ct or format_str.count("}") != expected_ct:
             raise ValueError(
@@ -2735,12 +2796,23 @@ def get_dns_name_and_fallback_mount_target_ip_address(config, fs_id, options):
         )
         dns_name = dns_name_format.format(**format_args)
 
+    if IPV6_ENABLED in options:
+        ipv6_addresses = get_ipv6_addresses(dns_name)
+        if not ipv6_addresses:
+            logging.warning("IPv6 specified but no IPv6 address found for %s", dns_name)
+            options.pop(IPV6_ENABLED, None)
+            options.pop("ipv6", None)
+
     if "mounttargetip" in options:
-        if "crossaccount" in options:
-            fatal_error(
-                "mounttargetip option is incompatible with crossaccount option."
-            )
         ip_address = options.get("mounttargetip")
+        try:
+            ip = ipaddress.ip_address(ip_address)
+            if isinstance(ip, ipaddress.IPv6Address):
+                options[IPV6_ENABLED] = True
+        except ValueError:
+            # Not a valid IP address, will be handled as a hostname later
+            pass
+
         logging.info(
             "Use the mount target ip address %s provided in the mount options to mount."
             % ip_address
@@ -2759,6 +2831,19 @@ def get_dns_name_and_fallback_mount_target_ip_address(config, fs_id, options):
             )
 
     if dns_name_can_be_resolved(dns_name):
+        try:
+            addrinfo = socket.getaddrinfo(dns_name, None, socket.AF_UNSPEC)
+            ip = ipaddress.ip_address(addrinfo[0][4][0])
+            if isinstance(ip, ipaddress.IPv6Address):
+                options[IPV6_ENABLED] = True
+            elif IPV6_ENABLED in options:
+                logging.warning(
+                    "IPv6 option was specified, but IPv4 address was returned. Falling back to IPv4."
+                )
+                options.pop(IPV6_ENABLED, None)  # Remove IPV6_ENABLED key
+                options.pop("ipv6", None)  # Remove the 'ipv6' key
+        except ValueError:
+            pass
         return dns_name, None
 
     logging.info(
@@ -2845,9 +2930,17 @@ def check_and_remove_lock_file(path, file):
             )
 
 
+def strip_brackets(address):
+    """Remove square brackets from an IPv6 literal if present."""
+    if address.startswith("[") and address.endswith("]"):
+        return address[1:-1]
+    return address
+
+
 def dns_name_can_be_resolved(dns_name):
+    host = strip_brackets(dns_name)
     try:
-        socket.gethostbyname(dns_name)
+        socket.gethostbyname(host)
         return True
     except socket.gaierror:
         return False
@@ -2861,12 +2954,26 @@ def mount_target_ip_address_can_be_resolved(
         try:
             # Open a socket connection to mount target nfs port to verify that the mount target can be connected
             if not network_namespace:
-                s = socket.create_connection((mount_target_ip_address, 2049), timeout=2)
-            else:
-                with NetNS(nspath=network_namespace):
+                ip = ipaddress.ip_address(mount_target_ip_address)
+                if isinstance(ip, ipaddress.IPv6Address):
                     s = socket.create_connection(
                         (mount_target_ip_address, 2049), timeout=2
                     )
+                else:
+                    s = socket.create_connection(
+                        (mount_target_ip_address, 2049), timeout=2
+                    )
+            else:
+                with NetNS(nspath=network_namespace):
+                    ip = ipaddress.ip_address(mount_target_ip_address)
+                    if isinstance(ip, ipaddress.IPv6Address):
+                        s = socket.create_connection(
+                            (mount_target_ip_address, 2049), timeout=2
+                        )
+                    else:
+                        s = socket.create_connection(
+                            (mount_target_ip_address, 2049), timeout=2
+                        )
             s.close()
             return True
         except socket.timeout:
@@ -2905,8 +3012,25 @@ def get_fallback_mount_target_ip_address_helper(config, options, fs_id):
 
     mount_target = get_mount_target_in_az(efs_client, ec2_client, fs_id, az_name)
     mount_target_ip = mount_target.get("IpAddress")
-    logging.debug("Found mount target ip address %s in AZ %s", mount_target_ip, az_name)
 
+    if IPV6_ENABLED in options and not is_ipv6_address(mount_target_ip):
+        ipv6_mount_targets = [
+            mt
+            for mt in get_mount_targets_info(efs_client, fs_id)
+            if mt.get("LifeCycleState") == "available"
+            and is_ipv6_address(mt.get("IpAddress"))
+        ]
+        if ipv6_mount_targets:
+            mount_target_ip = random.choice(ipv6_mount_targets).get("IpAddress")
+            logging.info(
+                "IPv6 option specified, using IPv6 mount target: %s", mount_target_ip
+            )
+        else:
+            logging.warning(
+                "IPv6 option specified, but no IPv6 mount targets found. Using IPv4 mount target."
+            )
+
+    logging.debug("Found mount target ip address %s in AZ %s", mount_target_ip, az_name)
     return mount_target_ip
 
 
@@ -3324,6 +3448,9 @@ def check_options_validity(options):
         # The URI must start with slash symbol as it will be appended to the ECS task metadata endpoint
         if not options["awscredsuri"].startswith("/"):
             fatal_error("awscredsuri %s is malformed" % options["awscredsuri"])
+
+    if "ipv6" in options:
+        options[IPV6_ENABLED] = True
 
 
 def bootstrap_cloudwatch_logging(config, options, fs_id=None):
